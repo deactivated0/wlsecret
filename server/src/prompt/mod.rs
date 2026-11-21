@@ -1,0 +1,513 @@
+// org.freedesktop.Secret.Prompt
+
+use std::{future::Future, os::fd::AsFd, pin::Pin, str::FromStr, sync::Arc};
+
+use formatx::formatx;
+use gettextrs::gettext;
+use oo7::{Secret, dbus::ServiceError};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{Mutex, OnceCell},
+};
+use zbus::{
+    interface,
+    object_server::SignalEmitter,
+    wire::{ObjectPath, Optional, OwnedObjectPath, OwnedVariant},
+};
+
+#[cfg(any(feature = "gnome_native_crypto", feature = "gnome_openssl_crypto"))]
+use crate::gnome::prompter::{GNOMEPrompterCallback, GNOMEPrompterProxy};
+#[cfg(any(feature = "plasma_native_crypto", feature = "plasma_openssl_crypto"))]
+use crate::plasma::prompter::PlasmaPrompterCallback;
+use crate::{
+    error::custom_service_error,
+    service::{PrompterType, Service},
+};
+
+#[zbus::proxy(
+    interface = "org.freedesktop.secrets.CliPrompter",
+    default_service = "org.freedesktop.secrets.CliPrompter",
+    default_path = "/org/freedesktop/secrets/CliPrompter"
+)]
+trait CliPrompter {
+    #[zbus(no_autostart)]
+    async fn prompt(
+        &self,
+        label: &str,
+        description: &str,
+    ) -> zbus::Result<(zbus::wire::OwnedFd, bool)>;
+}
+
+pub const MAX_UNLOCK_ATTEMPTS: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptRole {
+    Unlock,
+    CreateCollection,
+    ChangePassword,
+}
+
+/// A boxed future that represents the action to be taken when a prompt
+/// completes
+pub type PromptActionFuture =
+    Pin<Box<dyn Future<Output = Result<OwnedVariant, ServiceError>> + Send + 'static>>;
+
+/// Represents the action to be taken when a prompt completes
+pub struct PromptAction {
+    /// The async function to execute when the prompt is accepted
+    action: Box<dyn FnOnce(Option<Secret>) -> PromptActionFuture + Send>,
+}
+
+impl PromptAction {
+    /// Create a new prompt action from a closure that takes an optional secret
+    /// and returns a future
+    pub fn new<F, Fut>(f: F) -> Self
+    where
+        F: FnOnce(Option<Secret>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<OwnedVariant, ServiceError>> + Send + 'static,
+    {
+        Self {
+            action: Box::new(move |secret| Box::pin(f(secret))),
+        }
+    }
+
+    /// Execute the action with the provided secret
+    pub async fn execute(self, secret: Option<Secret>) -> Result<OwnedVariant, ServiceError> {
+        (self.action)(secret).await
+    }
+}
+
+#[derive(Clone)]
+pub struct Prompt {
+    service: Service,
+    role: PromptRole,
+    path: OwnedObjectPath,
+    /// The label of the collection/keyring being prompted for
+    label: String,
+    /// The collection for Unlock prompts (needed for secret validation)
+    collection: Option<crate::collection::Collection>,
+    /// GNOME Specific
+    #[cfg(any(feature = "gnome_native_crypto", feature = "gnome_openssl_crypto"))]
+    gnome_callback: Arc<OnceCell<GNOMEPrompterCallback>>,
+    /// KDE Plasma Specific
+    #[cfg(any(feature = "plasma_native_crypto", feature = "plasma_openssl_crypto"))]
+    plasma_callback: Arc<OnceCell<PlasmaPrompterCallback>>,
+    /// The action to execute when the prompt completes
+    action: Arc<Mutex<Option<PromptAction>>>,
+}
+
+#[cfg(any(
+    feature = "gnome_openssl_crypto",
+    feature = "gnome_native_crypto",
+    feature = "plasma_native_crypto",
+    feature = "plasma_openssl_crypto"
+))] // User has to enable at least one prompt backend
+#[interface(name = "org.freedesktop.Secret.Prompt")]
+impl Prompt {
+    pub async fn prompt(
+        &self,
+        window_id: Optional<&str>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), ServiceError> {
+        let window_id = (*window_id).and_then(|w| ashpd::WindowIdentifierType::from_str(w).ok());
+        let peer_info = match Service::sender(&header) {
+            Some(sender) => self.service.peer_info(&sender).await,
+            None => None,
+        };
+
+        match self.service.prompter_type(peer_info.as_ref()).await {
+            #[cfg(any(feature = "plasma_native_crypto", feature = "plasma_openssl_crypto"))]
+            PrompterType::Plasma => self.prompt_plasma(window_id).await,
+            #[cfg(any(feature = "gnome_native_crypto", feature = "gnome_openssl_crypto"))]
+            PrompterType::GNOME => self.prompt_gnome(window_id).await,
+            PrompterType::Cli => self.prompt_cli().await,
+            #[allow(unreachable_patterns)]
+            _ => Err(custom_service_error(
+                "No prompt backend available in the current environment.",
+            )),
+        }
+    }
+
+    pub async fn dismiss(&self) -> Result<(), ServiceError> {
+        #[cfg(any(feature = "plasma_native_crypto", feature = "plasma_openssl_crypto"))]
+        if let Some(callback) = self.plasma_callback.get() {
+            let emitter = SignalEmitter::from_parts(
+                self.service.connection().clone(),
+                callback.path().clone(),
+            );
+            PlasmaPrompterCallback::dismiss(&emitter).await?;
+        }
+
+        #[cfg(any(feature = "gnome_native_crypto", feature = "gnome_openssl_crypto"))]
+        if let Some(_callback) = self.gnome_callback.get() {
+            // TODO: figure out if we should destroy the un-export the callback
+            // here?
+        }
+
+        self.service
+            .object_server()
+            .remove::<Self, _>(&self.path)
+            .await?;
+        self.service.remove_prompt(&self.path).await;
+
+        Ok(())
+    }
+
+    #[zbus(signal, name = "Completed")]
+    pub async fn completed(
+        signal_emitter: &SignalEmitter<'_>,
+        dismissed: bool,
+        result: OwnedVariant,
+    ) -> zbus::Result<()>;
+}
+
+impl Prompt {
+    pub async fn new(
+        service: Service,
+        role: PromptRole,
+        label: String,
+        collection: Option<crate::collection::Collection>,
+    ) -> Self {
+        let index = service.prompt_index();
+        let path =
+            OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/prompt/p{index}")).unwrap();
+        Self::with_path(service, role, label, collection, path)
+    }
+
+    pub fn with_path(
+        service: Service,
+        role: PromptRole,
+        label: String,
+        collection: Option<crate::collection::Collection>,
+        path: OwnedObjectPath,
+    ) -> Self {
+        Self {
+            path,
+            service,
+            role,
+            label,
+            collection,
+            #[cfg(any(feature = "gnome_native_crypto", feature = "gnome_openssl_crypto"))]
+            gnome_callback: Default::default(),
+            #[cfg(any(feature = "plasma_native_crypto", feature = "plasma_openssl_crypto"))]
+            plasma_callback: Default::default(),
+            action: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn path(&self) -> &ObjectPath<'_> {
+        &self.path
+    }
+
+    pub fn role(&self) -> PromptRole {
+        self.role
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn collection(&self) -> Option<&crate::collection::Collection> {
+        self.collection.as_ref()
+    }
+
+    /// Set the action to execute when the prompt completes
+    pub async fn set_action(&self, action: PromptAction) {
+        *self.action.lock().await = Some(action);
+    }
+
+    /// Take the action, consuming it so it can only be executed once
+    async fn take_action(&self) -> Option<PromptAction> {
+        self.action.lock().await.take()
+    }
+
+    pub async fn on_unlock_collection(&self, secret: Option<Secret>) -> Result<bool, ServiceError> {
+        debug_assert_eq!(self.role, PromptRole::Unlock);
+
+        // Get the collection to validate the secret
+        let collection = self.collection().expect("Unlock requires a collection");
+        let label = self.label();
+
+        // The placeholder of a pending migration accepts any secret;
+        // validate against the legacy keyring instead.
+        let pending_migration = {
+            let pending = self.service.pending_migrations.lock().await;
+            pending.get(collection.name()).cloned()
+        };
+
+        let is_valid = if let Some(migration) = pending_migration {
+            match secret.as_ref() {
+                Some(secret) => migration.validate_secret(secret).await.map_err(|err| {
+                    custom_service_error(&format!(
+                        "Failed to validate secret for {label} keyring: {err}."
+                    ))
+                })?,
+                // A pending migration always requires a secret.
+                None => false,
+            }
+        } else if let Some(ref secret) = secret {
+            // Validate the secret using the already-open keyring
+            let keyring_guard = collection.keyring.read().await;
+            let valid = keyring_guard
+                .as_ref()
+                .unwrap()
+                .validate_secret(secret)
+                .await
+                .map_err(|err| {
+                    custom_service_error(&format!(
+                        "Failed to validate secret for {label} keyring: {err}."
+                    ))
+                })?;
+            drop(keyring_guard);
+            valid
+        } else {
+            // No secret means unencrypted -> validate items are plaintext
+            let keyring_guard = collection.keyring.read().await;
+            let valid = keyring_guard
+                .as_ref()
+                .unwrap()
+                .validate_unencrypted()
+                .await
+                .map_err(|err| {
+                    custom_service_error(&format!(
+                        "Failed to validate unencrypted keyring {label}: {err}."
+                    ))
+                })?;
+            drop(keyring_guard);
+            valid
+        };
+
+        if is_valid {
+            tracing::debug!("Keyring secret matches for {label}.");
+
+            let Some(action) = self.take_action().await else {
+                return Err(custom_service_error(
+                    "Prompt action was already executed or not set",
+                ));
+            };
+
+            // Execute the unlock action after successful validation
+            let result_value = match action.execute(secret).await {
+                Ok(value) => value,
+                Err(err) => {
+                    self.emit_dismissed().await;
+                    return Err(err);
+                }
+            };
+
+            let prompt_path = self.path().to_owned();
+            let signal_emitter = self.service.signal_emitter(&prompt_path)?;
+            tokio::spawn(async move {
+                tracing::debug!("Unlock prompt completed.");
+                let _ = Prompt::completed(&signal_emitter, false, result_value).await;
+            });
+            Ok(true)
+        } else {
+            tracing::error!("Keyring {label} failed to unlock, incorrect secret.");
+
+            Ok(false)
+        }
+    }
+
+    pub async fn on_create_collection(&self, secret: Option<Secret>) -> Result<(), ServiceError> {
+        debug_assert_eq!(self.role, PromptRole::CreateCollection);
+
+        let Some(action) = self.take_action().await else {
+            return Err(custom_service_error(
+                "Prompt action was already executed or not set",
+            ));
+        };
+
+        // Execute the collection creation action with the secret
+        match action.execute(secret).await {
+            Ok(collection_path_value) => {
+                tracing::info!("CreateCollection action completed successfully");
+
+                let signal_emitter = self.service.signal_emitter(self.path().to_owned())?;
+
+                tokio::spawn(async move {
+                    tracing::debug!("CreateCollection prompt completed.");
+                    let _ = Prompt::completed(&signal_emitter, false, collection_path_value).await;
+                });
+                Ok(())
+            }
+            Err(err) => {
+                self.emit_dismissed().await;
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn on_change_password(&self, secret: Option<Secret>) -> Result<(), ServiceError> {
+        debug_assert_eq!(self.role, PromptRole::ChangePassword);
+
+        let Some(action) = self.take_action().await else {
+            return Err(custom_service_error(
+                "Prompt action was already executed or not set",
+            ));
+        };
+
+        // Execute the change password action with the new secret
+        match action.execute(secret).await {
+            Ok(result) => {
+                tracing::info!("ChangePassword action completed successfully");
+
+                let signal_emitter = self.service.signal_emitter(self.path().to_owned())?;
+
+                tokio::spawn(async move {
+                    tracing::debug!("ChangePassword prompt completed.");
+                    let _ = Prompt::completed(&signal_emitter, false, result).await;
+                });
+                Ok(())
+            }
+            Err(err) => {
+                self.emit_dismissed().await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn emit_dismissed(&self) {
+        if let Ok(signal_emitter) = self.service.signal_emitter(self.path().to_owned()) {
+            let result = zbus::wire::Variant::new::<Vec<OwnedObjectPath>>(vec![])
+                .try_into_owned()
+                .unwrap();
+            let _ = Prompt::completed(&signal_emitter, true, result).await;
+        }
+    }
+
+    #[cfg(any(feature = "plasma_native_crypto", feature = "plasma_openssl_crypto"))]
+    async fn prompt_plasma(
+        &self,
+        window_id: Option<ashpd::WindowIdentifierType>,
+    ) -> Result<(), ServiceError> {
+        if self.plasma_callback.get().is_some() {
+            return Ok(());
+        }
+
+        let callback = PlasmaPrompterCallback::new(self.service.clone(), self.path.clone()).await;
+        let path = OwnedObjectPath::from(callback.path().clone());
+
+        let _ = self.plasma_callback.set(callback.clone());
+        self.service
+            .object_server()
+            .at(&path, callback.clone())
+            .await?;
+        tracing::debug!("Prompt `{}` created.", self.path);
+
+        callback.start(&self.role, window_id, &self.label).await
+    }
+
+    #[cfg(any(feature = "gnome_native_crypto", feature = "gnome_openssl_crypto"))]
+    async fn prompt_gnome(
+        &self,
+        window_id: Option<ashpd::WindowIdentifierType>,
+    ) -> Result<(), ServiceError> {
+        if self.gnome_callback.get().is_some() {
+            return Ok(());
+        };
+
+        let callback =
+            GNOMEPrompterCallback::new(window_id, self.service.clone(), self.path.clone())
+                .await
+                .map_err(|err| {
+                    custom_service_error(&format!("Failed to create GNOMEPrompterCallback {err}."))
+                })?;
+
+        let path = OwnedObjectPath::from(callback.path().clone());
+
+        let _ = self.gnome_callback.set(callback.clone());
+        self.service.object_server().at(&path, callback).await?;
+        tracing::debug!("Prompt `{}` created.", self.path);
+
+        let prompter = GNOMEPrompterProxy::new(&self.service.connection()).await?;
+        tokio::spawn(async move { prompter.begin_prompting(&path).await });
+
+        Ok(())
+    }
+
+    async fn prompt_cli(&self) -> Result<(), ServiceError> {
+        let proxy = CliPrompterProxy::new(&self.service.connection())
+            .await
+            .map_err(|e| custom_service_error(&format!("CLI prompter not available: {e}")))?;
+
+        let label = &self.label;
+        let description = match self.role {
+            PromptRole::Unlock => formatx!(
+                gettext("An application wants access to the keyring “{}”, but it is locked"),
+                label,
+            )
+            .expect("Wrong format in translatable string"),
+            PromptRole::CreateCollection => formatx!(
+                gettext("An application wants to create a new keyring called “{}”. Choose the password you want to use for it."),
+                label,
+            )
+            .expect("Wrong format in translatable string"),
+            PromptRole::ChangePassword => formatx!(
+                gettext("An application wants to change the password for the “{}” keyring. Choose the new password you want to use for it."),
+                label,
+            )
+            .expect("Wrong format in translatable string"),
+        };
+
+        let mut attempts = 0;
+        loop {
+            let (fd, accepted) = match proxy.prompt(&self.label, &description).await {
+                Ok(result) => result,
+                Err(e) => return Err(custom_service_error(&format!("CLI prompter failed: {e}"))),
+            };
+            if !accepted {
+                tracing::info!("CLI prompter dismissed by user.");
+                return Err(custom_service_error("Prompt dismissed by user."));
+            }
+
+            let std_stream = std::os::unix::net::UnixStream::from(
+                fd.as_fd().try_clone_to_owned().expect("Failed to clone fd"),
+            );
+            std_stream
+                .set_nonblocking(true)
+                .map_err(|e| custom_service_error(&format!("Failed to set non-blocking: {e}")))?;
+            let mut stream = tokio::net::UnixStream::from_std(std_stream)
+                .expect("Failed to create Tokio UnixStream");
+            let mut buffer = zeroize::Zeroizing::new(Vec::new());
+            stream.read_to_end(&mut buffer).await.map_err(|e| {
+                custom_service_error(&format!("Failed to read secret from CLI prompter: {e}"))
+            })?;
+            let secret = if buffer.is_empty() {
+                None
+            } else {
+                Some(Secret::from(buffer.as_slice()))
+            };
+
+            match self.role {
+                PromptRole::Unlock => {
+                    if self.on_unlock_collection(secret).await? {
+                        return Ok(());
+                    }
+
+                    attempts += 1;
+                    if attempts >= MAX_UNLOCK_ATTEMPTS {
+                        tracing::warn!(
+                            "Maximum unlock attempts ({MAX_UNLOCK_ATTEMPTS}) reached, \
+                             dismissing prompt."
+                        );
+                        self.emit_dismissed().await;
+                        return Ok(());
+                    }
+                    // Prompt again, the secret was incorrect
+                }
+                PromptRole::CreateCollection => {
+                    self.on_create_collection(secret).await?;
+                    return Ok(());
+                }
+                PromptRole::ChangePassword => {
+                    self.on_change_password(secret).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

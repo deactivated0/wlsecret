@@ -1,0 +1,194 @@
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+use zgvariant::Type;
+
+use super::{Error, UnlockedItem};
+use crate::{
+    AsAttributes, CONTENT_TYPE_ATTRIBUTE, GENERIC_SCHEMA, Key, Mac, XDG_SCHEMA_ATTRIBUTE, crypto,
+};
+
+#[derive(Deserialize, Serialize, Type, Debug, Clone, Zeroize, ZeroizeOnDrop)]
+pub(crate) struct EncryptedItem {
+    #[zeroize(skip)]
+    pub(crate) hashed_attributes: HashMap<String, Mac>,
+    #[serde(with = "serde_bytes")]
+    pub(crate) blob: Vec<u8>,
+}
+
+type HashedAttributesMac = (
+    Vec<(String, Result<Mac, crate::crypto::Error>)>,
+    Result<Mac, crate::crypto::Error>,
+);
+
+#[derive(Debug)]
+pub struct PreparedQuery {
+    encrypted: Option<HashedAttributesMac>,
+    plain: HashMap<String, String>,
+}
+
+impl PreparedQuery {
+    pub fn new(attributes: &impl AsAttributes, key: Option<&Key>) -> Self {
+        let plain = attributes.search_attributes();
+        let encrypted = key.map(|key| {
+            let generic_schema_mac = crypto::compute_mac(GENERIC_SCHEMA.as_bytes(), key);
+            let hashed = attributes.hash(key);
+            (hashed, generic_schema_mac)
+        });
+        Self {
+            encrypted,
+            plain,
+        }
+    }
+
+    pub fn matches_plain(&self, item_attrs: &HashMap<String, String>) -> bool {
+        self.plain.iter().all(|(k, value)| {
+            if k == XDG_SCHEMA_ATTRIBUTE
+                && !item_attrs.contains_key(XDG_SCHEMA_ATTRIBUTE)
+                && value == GENERIC_SCHEMA
+            {
+                return true;
+            }
+            item_attrs.get(k.as_str()).map(|v| v.as_ref()) == Some(value.as_str())
+        })
+    }
+}
+
+impl EncryptedItem {
+    pub fn has_attribute(&self, key: &str, value_mac: &Mac) -> bool {
+        self.hashed_attributes.get(key) == Some(value_mac)
+    }
+
+    fn has_plaintext_attribute(&self, key: &str, value: &str) -> bool {
+        self.hashed_attributes
+            .get(key)
+            .is_some_and(|mac| mac.as_slice() == value.as_bytes())
+    }
+
+    pub fn matches_prepared(&self, query: &PreparedQuery) -> bool {
+        if let Some((hashed, generic_schema_mac)) = &query.encrypted {
+            hashed.iter().all(|(k, v)| {
+                if k == XDG_SCHEMA_ATTRIBUTE
+                    && !self.hashed_attributes.contains_key(XDG_SCHEMA_ATTRIBUTE)
+                {
+                    return v
+                        .as_ref()
+                        .is_ok_and(|v| generic_schema_mac.as_ref().is_ok_and(|g| v == g));
+                }
+                v.as_ref().is_ok_and(|v| self.has_attribute(k.as_str(), v))
+            })
+        } else {
+            query.plain.iter().all(|(k, v)| {
+                if k == XDG_SCHEMA_ATTRIBUTE
+                    && !self.hashed_attributes.contains_key(XDG_SCHEMA_ATTRIBUTE)
+                    && v == GENERIC_SCHEMA
+                {
+                    return true;
+                }
+                self.has_plaintext_attribute(k.as_str(), v.as_str())
+            })
+        }
+    }
+
+    pub fn matches(&self, attributes: &impl AsAttributes, key: Option<&Key>) -> bool {
+        self.matches_prepared(&PreparedQuery::new(attributes, key))
+    }
+
+    pub fn matches_exact(&self, attributes: &impl AsAttributes, key: Option<&Key>) -> bool {
+        // The secret's content type does not identify the item.
+        let attributes = attributes.as_search_attributes();
+        let mut count = self.hashed_attributes.len()
+            - usize::from(self.hashed_attributes.contains_key(CONTENT_TYPE_ATTRIBUTE));
+        // Items without a schema are implicitly generic, see `matches`
+        if !self.hashed_attributes.contains_key(XDG_SCHEMA_ATTRIBUTE)
+            && attributes.get(XDG_SCHEMA_ATTRIBUTE).map(String::as_str) == Some(GENERIC_SCHEMA)
+        {
+            count += 1;
+        }
+        count == attributes.len() && self.matches(&attributes, key)
+    }
+
+    fn try_decrypt_inner(&self, key: Option<&Key>) -> Result<UnlockedItem, Error> {
+        match key {
+            Some(key) => self.try_decrypt_encrypted(key),
+            None => UnlockedItem::try_from(self.blob.as_slice()),
+        }
+    }
+
+    fn try_decrypt_encrypted(&self, key: &Key) -> Result<UnlockedItem, Error> {
+        let n = self.blob.len();
+        let n_mac = crypto::mac_len();
+        let n_iv = crypto::iv_len();
+
+        // The encrypted data, the iv, and the mac are concatenated into blob.
+        if n < n_mac + n_iv {
+            return Err(Error::NoData);
+        }
+        let (encrypted_data_with_iv, mac_tag) = &self.blob.split_at(n - n_mac);
+
+        // verify item
+        if !crypto::verify_mac(encrypted_data_with_iv, key, mac_tag)? {
+            return Err(Error::MacError);
+        }
+
+        let (encrypted_data, iv) = encrypted_data_with_iv.split_at(n - n_mac - n_iv);
+
+        // decrypt item
+        let decrypted = crypto::decrypt(encrypted_data, key, iv)?;
+
+        let item = UnlockedItem::try_from(decrypted.as_slice())?;
+
+        Self::validate(&self.hashed_attributes, &item, key)?;
+
+        Ok(item)
+    }
+
+    pub fn is_valid(&self, key: Option<&Key>) -> bool {
+        self.try_decrypt_inner(key).is_ok()
+    }
+
+    pub fn decrypt(&self, key: Option<&Key>) -> Result<UnlockedItem, Error> {
+        self.try_decrypt_inner(key)
+    }
+
+    fn validate(
+        hashed_attributes: &HashMap<String, Mac>,
+        item: &UnlockedItem,
+        key: &Key,
+    ) -> Result<(), Error> {
+        for (attribute_key, hashed_attribute) in hashed_attributes.iter() {
+            if let Some(attribute_plaintext) = item.attributes().get(attribute_key) {
+                if !crypto::verify_mac(
+                    attribute_plaintext.as_bytes(),
+                    key,
+                    hashed_attribute.as_slice(),
+                )? {
+                    return Err(Error::HashedAttributeMac(attribute_key.to_owned()));
+                }
+            } else {
+                return Err(Error::HashedAttributeMac(attribute_key.to_owned()));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrypt_short_blob_is_an_error() {
+        // The placeholder items of a pending migration carry no blob
+        let item = EncryptedItem {
+            hashed_attributes: HashMap::new(),
+            blob: Vec::new(),
+        };
+        let key = Key::new(vec![
+            132, 3, 113, 222, 81, 209, 49, 43, 81, 232, 243, 46, 1, 103, 184, 42,
+        ]);
+        assert!(matches!(item.decrypt(Some(&key)), Err(Error::NoData)));
+    }
+}

@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build - ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: false
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: true
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            use-cross: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use-cross: false
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use-cross: false
+            archive: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux' && !matrix.use-cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libdbus-1-dev pkg-config
+
+      - name: Install cross
+        if: matrix.use-cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binaries
+        run: |
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p wlsecret-daemon -p wlsecret-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p wlsecret-daemon -p wlsecret-cli
+          fi
+        shell: bash
+
+      - name: Package artifacts (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          STAGING="wlsecret-${{ matrix.target }}"
+          mkdir -p "$STAGING"
+          cp target/${{ matrix.target }}/release/wlsecret-daemon "$STAGING/" || cp target/release/wlsecret-daemon "$STAGING/" || true
+          cp target/${{ matrix.target }}/release/wlsecret-cli "$STAGING/" || cp target/release/wlsecret-cli "$STAGING/" || true
+          # Compatibility symlinks
+          ln -sf wlsecret-daemon "$STAGING/oo7-daemon"
+          ln -sf wlsecret-cli "$STAGING/oo7-cli"
+          cp LICENSE README.md "$STAGING/"
+          tar -czvf "wlsecret-${{ matrix.target }}.tar.gz" -C "$STAGING" .
+          sha256sum "wlsecret-${{ matrix.target }}.tar.gz" > "wlsecret-${{ matrix.target }}.tar.gz.sha256"
+        shell: bash
+
+      - name: Package artifacts (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $STAGING = "wlsecret-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $STAGING -Force
+          Copy-Item "target/${{ matrix.target }}/release/wlsecret-daemon.exe" "$STAGING/" -ErrorAction SilentlyContinue
+          Copy-Item "target/${{ matrix.target }}/release/wlsecret-cli.exe" "$STAGING/" -ErrorAction SilentlyContinue
+          Copy-Item "LICENSE", "README.md" "$STAGING/"
+          Compress-Archive -Path "$STAGING/*" -DestinationPath "wlsecret-${{ matrix.target }}.zip"
+          (Get-FileHash -Path "wlsecret-${{ matrix.target }}.zip" -Algorithm SHA256).Hash | Out-File -FilePath "wlsecret-${{ matrix.target }}.zip.sha256"
+        shell: pwsh
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wlsecret-${{ matrix.target }}
+          path: |
+            wlsecret-${{ matrix.target }}.*
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p dist
+          find release-artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec cp {} dist/ \;
+          ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

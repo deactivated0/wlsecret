@@ -1,0 +1,176 @@
+use std::{collections::HashMap, sync::Arc};
+mod error;
+
+use ashpd::{
+    PortalError, async_trait,
+    desktop::HandleToken,
+    zbus::{self, wire::OwnedVariant},
+};
+use clap::Parser;
+pub use error::Result;
+use oo7::dbus::Service;
+use tokio::{io::AsyncWriteExt, sync::Mutex, task::AbortHandle};
+
+const PORTAL_NAME: &str = "org.freedesktop.impl.portal.desktop.oo7";
+
+#[derive(Default)]
+struct Secret {
+    active_requests: Arc<Mutex<HashMap<HandleToken, AbortHandle>>>,
+}
+
+#[async_trait::async_trait]
+impl ashpd::backend::request::RequestImpl for Secret {
+    async fn close(&self, token: HandleToken) {
+        tracing::debug!("Closing request with token: {:?}", token);
+
+        let mut requests = self.active_requests.lock().await;
+        if let Some(abort_handle) = requests.remove(&token) {
+            tracing::debug!("Aborting active request for token: {:?}", token);
+            abort_handle.abort();
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ashpd::backend::secret::SecretImpl for Secret {
+    async fn retrieve(
+        &self,
+        token: HandleToken,
+        app_id: ashpd::MaybeAppID,
+        fd: std::os::fd::OwnedFd,
+        options: ashpd::desktop::secret::RetrieveOptions,
+    ) -> ashpd::backend::Result<HashMap<String, OwnedVariant>> {
+        tracing::debug!("Request from app: {app_id}");
+
+        let task = tokio::spawn(async move { send_secret_to_app(&app_id, fd, options).await });
+
+        // Store the abort handle for this request
+        {
+            let mut requests = self.active_requests.lock().await;
+            requests.insert(token.clone(), task.abort_handle());
+        }
+
+        let result = task.await;
+
+        // Remove the request from active requests once completed
+        {
+            let mut requests = self.active_requests.lock().await;
+            requests.remove(&token);
+        }
+
+        result
+            .map_err(|e| ashpd::PortalError::Failed(format!("Task failed: {e}")))?
+            .map_err(|e| ashpd::PortalError::Failed(format!("Could not retrieve secret {e}")))?;
+
+        Ok(Default::default())
+    }
+}
+
+/// Generates, stores and send the secret back to the fd stream
+async fn send_secret_to_app(
+    app_id: &ashpd::MaybeAppID,
+    fd: std::os::fd::OwnedFd,
+    options: ashpd::desktop::secret::RetrieveOptions,
+) -> Result<()> {
+    let service = Service::new().await?;
+    let collection = service.default_collection().await?;
+    // Native apps can have a desktop file name or an empty ID. Keep the
+    // original value to find secrets stored by other portal backends.
+    let app_id = app_id.to_string();
+    let attributes = &[("app_id", app_id.as_str())];
+
+    // Write the secret to the FD (may be a pipe or a socket).
+    let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
+
+    if collection.is_locked().await? {
+        collection
+            .unlock(options.parent_window().cloned().map(Into::into))
+            .await?;
+    }
+
+    if let Some(item) = collection.search_items(attributes).await?.first() {
+        file.write_all(&item.secret().await?).await?;
+    } else {
+        tracing::debug!("Could not find secret for {app_id}, creating one");
+        let secret = oo7::Secret::random().unwrap();
+
+        collection
+            .create_item(
+                &format!("Secret Portal token for {app_id}"),
+                attributes,
+                secret.clone(),
+                true,
+                None,
+            )
+            .await?;
+
+        file.write_all(&secret).await?;
+    }
+
+    Ok(())
+}
+
+/// A backend implementation for org.freedesktop.impl.portal.Secret.
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Replace a running instance
+    #[arg(short, long)]
+    replace: bool,
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Print debug information during command processing."
+    )]
+    is_verbose: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if args.is_verbose {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .init();
+        tracing::debug!("Running in verbose mode");
+    } else {
+        tracing_subscriber::fmt::init();
+    }
+
+    tracing::info!(
+        "Initializing {} {}",
+        env!("CARGO_BIN_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let mut flags =
+        zbus::fdo::RequestNameFlags::ALLOW_REPLACEMENT | zbus::fdo::RequestNameFlags::DO_NOT_QUEUE;
+    if args.replace {
+        flags |= zbus::fdo::RequestNameFlags::REPLACE_EXISTING;
+    }
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    let backend = ashpd::backend::Builder::new(PORTAL_NAME)?
+        .secret(Secret::default())
+        .with_flags(flags)
+        .build();
+
+    tokio::select! {
+        result = backend => {
+            result.inspect_err(|err| {
+                if let PortalError::ZBus(zbus::Error::NameTaken) = err {
+                    tracing::error!(
+                        "There is an instance already running. Run with --replace to replace it."
+                    );
+                }
+            })?;
+            tracing::info!("D-Bus connection lost, shutting down");
+        }
+        _ = tokio::signal::ctrl_c() => tracing::info!("Received SIGINT, shutting down"),
+        _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down"),
+    }
+
+    Ok(())
+}

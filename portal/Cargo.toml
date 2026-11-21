@@ -1,0 +1,30 @@
+[package]
+name = "oo7-portal"
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+edition.workspace = true
+exclude.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Secret portal implementation using oo7"
+
+[dependencies]
+ashpd = {workspace = true, features = ["backend", "secret", "tracing"]}
+clap.workspace = true
+oo7 = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[features]
+default = ["native_crypto"]
+native_crypto = [
+    "oo7/native_crypto"
+]
+openssl_crypto = [
+    "oo7/openssl_crypto"
+]

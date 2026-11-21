@@ -1,0 +1,1163 @@
+#![deny(unsafe_code)]
+
+mod merge;
+
+use std::{
+    collections::HashMap,
+    fmt,
+    io::{IsTerminal, Read, Write},
+    path::PathBuf,
+    process::{ExitCode, Termination},
+    time::Duration,
+};
+
+use clap::{Args, Parser, Subcommand};
+use merge::OnConflict;
+use oo7::dbus::Service;
+use serde::Serialize;
+use time::{OffsetDateTime, UtcOffset};
+
+const BINARY_NAME: &str = env!("CARGO_BIN_NAME");
+const H_STYLE: anstyle::Style = anstyle::Style::new().bold().underline();
+
+pub(crate) struct CliPrompter;
+
+#[zbus::interface(name = "org.freedesktop.secrets.CliPrompter")]
+impl CliPrompter {
+    async fn prompt(
+        &self,
+        _label: &str,
+        description: &str,
+    ) -> zbus::fdo::Result<(zbus::wire::OwnedFd, bool)> {
+        let password = match rpassword::prompt_password(format!("{description}: ")) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to read password: {e}");
+                return Err(zbus::fdo::Error::Failed(e.to_string()));
+            }
+        };
+        let (read_fd, write_fd) = std::os::unix::net::UnixStream::pair()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        {
+            use std::io::Write;
+            (&write_fd)
+                .write_all(password.as_bytes())
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+        drop(write_fd);
+        Ok((
+            zbus::wire::OwnedFd::from(std::os::fd::OwnedFd::from(read_fd)),
+            true,
+        ))
+    }
+}
+
+// TODO: replace with https://github.com/linux-credentials/oo7/issues/94
+#[zbus::proxy(
+    interface = "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface",
+    default_service = "org.freedesktop.secrets",
+    default_path = "/org/freedesktop/secrets"
+)]
+trait InternalInterface {
+    #[zbus(name = "ChangeWithPrompt")]
+    fn change_with_prompt(
+        &self,
+        collection: &zbus::wire::ObjectPath<'_>,
+    ) -> zbus::Result<zbus::wire::OwnedObjectPath>;
+}
+
+pub(crate) enum Error {
+    Owned(String),
+    Borrowed(&'static str),
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Owned(s) => f.write_str(s),
+            Self::Borrowed(s) => f.write_str(s),
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Error {
+        Self::Owned(err.to_string())
+    }
+}
+
+impl From<oo7::file::Error> for Error {
+    fn from(err: oo7::file::Error) -> Error {
+        Self::Owned(err.to_string())
+    }
+}
+
+impl From<oo7::dbus::Error> for Error {
+    fn from(err: oo7::dbus::Error) -> Error {
+        Self::Owned(err.to_string())
+    }
+}
+
+impl From<zbus::Error> for Error {
+    fn from(err: zbus::Error) -> Error {
+        Self::Owned(err.to_string())
+    }
+}
+
+impl From<zbus::fdo::Error> for Error {
+    fn from(err: zbus::fdo::Error) -> Error {
+        Self::Owned(err.to_string())
+    }
+}
+
+impl Error {
+    fn new(s: &'static str) -> Self {
+        Self::Borrowed(s)
+    }
+}
+
+impl Termination for Error {
+    fn report(self) -> ExitCode {
+        ExitCode::FAILURE
+    }
+}
+
+#[derive(Serialize)]
+struct ItemOutput {
+    label: String,
+    /// Those are None if the item is locked
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attributes: Option<HashMap<String, String>>,
+    is_locked: bool,
+}
+
+impl ItemOutput {
+    fn new(
+        secret: Option<&oo7::Secret>,
+        label: &str,
+        mut attributes: Option<HashMap<String, String>>,
+        created: Option<Duration>,
+        modified: Option<Duration>,
+        is_locked: bool,
+        as_hex: bool,
+    ) -> Self {
+        let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+
+        let created = created.map(|created| {
+            OffsetDateTime::from_unix_timestamp(created.as_secs() as i64)
+                .unwrap()
+                .to_offset(local_offset)
+        });
+        let modified = modified.map(|modified| {
+            OffsetDateTime::from_unix_timestamp(modified.as_secs() as i64)
+                .unwrap()
+                .to_offset(local_offset)
+        });
+
+        let format = time::format_description::parse_borrowed::<2>(
+            "[year]-[month]-[day] [hour]:[minute]:[second]",
+        )
+        .unwrap();
+
+        let secret_str = secret.map(|s| {
+            if as_hex {
+                hex::encode(s.as_bytes())
+            } else {
+                match s.as_str() {
+                    Some(s) => s.to_string(),
+                    None => hex::encode(s.as_bytes()),
+                }
+            }
+        });
+
+        let schema = attributes
+            .as_mut()
+            .and_then(|attrs| attrs.remove(oo7::XDG_SCHEMA_ATTRIBUTE));
+        let content_type = attributes
+            .as_mut()
+            .and_then(|attrs| attrs.remove(oo7::CONTENT_TYPE_ATTRIBUTE));
+
+        Self {
+            label: label.to_string(),
+            secret: secret_str,
+            created_at: created.map(|created| created.format(&format).unwrap()),
+            modified_at: modified.map(|modified| modified.format(&format).unwrap()),
+            schema,
+            content_type,
+            attributes,
+            is_locked,
+        }
+    }
+
+    fn from_file_item(item: &oo7::file::UnlockedItem, as_hex: bool) -> Self {
+        Self::new(
+            Some(&item.secret()),
+            item.label(),
+            Some(
+                item.attributes()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            Some(item.created()),
+            Some(item.modified()),
+            false,
+            as_hex,
+        )
+    }
+
+    async fn from_dbus_item(item: &oo7::dbus::Item, as_hex: bool) -> Result<Self, Error> {
+        let is_locked = item.is_locked().await?;
+        if is_locked {
+            return Ok(Self::new(None, "(locked)", None, None, None, true, as_hex));
+        }
+
+        Ok(Self::new(
+            Some(&item.secret().await?),
+            &item.label().await?,
+            Some(item.attributes().await?),
+            Some(item.created().await?),
+            Some(item.modified().await?),
+            false,
+            as_hex,
+        ))
+    }
+}
+
+impl fmt::Display for ItemOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "[{}]", self.label)?;
+        if let Some(ref secret) = self.secret {
+            writeln!(f, "secret = {}", secret)?;
+        }
+        if let Some(ref created_at) = self.created_at {
+            writeln!(f, "created = {}", created_at)?;
+        }
+        if let Some(ref modified_at) = self.modified_at {
+            writeln!(f, "modified = {}", modified_at)?;
+        }
+        if let Some(schema) = &self.schema {
+            writeln!(f, "schema = {schema}")?;
+        }
+        if let Some(content_type) = &self.content_type {
+            writeln!(f, "content_type = {content_type}")?;
+        }
+        if let Some(attributes) = &self.attributes {
+            writeln!(f, "attributes = {:?}", attributes)?;
+        }
+        if self.is_locked {
+            writeln!(f, "locked = true")?;
+        } else {
+            writeln!(f, "locked = false")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct CollectionOutput {
+    alias: String,
+    label: String,
+    path: String,
+    is_locked: bool,
+    is_temporary: bool,
+}
+
+impl CollectionOutput {
+    async fn from_collection(collection: &oo7::dbus::Collection) -> Result<Self, Error> {
+        let path = collection.path().to_string();
+        let alias = path.split('/').next_back().unwrap_or_default().to_string();
+        let is_temporary = alias == Service::SESSION_COLLECTION;
+        Ok(Self {
+            alias,
+            label: collection.label().await?,
+            path,
+            is_locked: collection.is_locked().await?,
+            is_temporary,
+        })
+    }
+}
+
+impl fmt::Display for CollectionOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}\t{}\t{}", self.alias, self.label, self.path)?;
+        if self.is_locked {
+            write!(f, " (locked)")?;
+        }
+        if self.is_temporary {
+            write!(f, " (temporary)")?;
+        }
+        writeln!(f)
+    }
+}
+
+enum Keyring {
+    File(oo7::file::UnlockedKeyring),
+    Collection(oo7::dbus::Collection),
+}
+
+enum Output {
+    None,
+    SecretOnly(Vec<oo7::Secret>, bool), // secrets and hex flag
+    Items(Vec<ItemOutput>, bool),       // items and json flag
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    #[command(
+        name = "delete",
+        about = "Delete a secret",
+        after_help = format!("Will delete all secrets with matching attributes.\n\n{H_STYLE}Example:{H_STYLE:#}\n  {} delete smtp-port=1025", BINARY_NAME)
+    )]
+    Delete {
+        #[arg(
+            help = "List of attributes. This is a space-separated list of pairs key=value",
+            value_parser = parse_key_val::<String, String>,
+            required = true, num_args = 1
+        )]
+        attributes: Vec<(String, String)>,
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(
+        name = "lookup",
+        about = "Retrieve a secret",
+        after_help = format!("{H_STYLE}Examples:{H_STYLE:#}\n  {} lookup smtp-port=1025\n  {0} lookup --secret-only mysql-port=1234 | systemd-creds encrypt --name=mysql-password -p - -", BINARY_NAME)
+    )]
+    Lookup {
+        #[arg(
+            help = "List of attributes. This is a space-separated list of pairs key=value",
+            value_parser = parse_key_val::<String, String>,
+            required = true,
+            num_args = 1
+        )]
+        attributes: Vec<(String, String)>,
+        #[arg(long, help = "Print only the secret.")]
+        secret_only: bool,
+        #[arg(long, help = "Print the secret in hexadecimal.")]
+        hex: bool,
+        #[arg(long, help = "Format the output as json.")]
+        json: bool,
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(
+        name = "search",
+        about = "Search entries with matching attributes",
+        after_help = format!("{H_STYLE}Example:{H_STYLE:#}\n  {} search --all smtp-port=1025", BINARY_NAME)
+    )]
+    Search {
+        #[arg(
+            short,
+            long,
+            help = "Whether to list all possible matches or only the first result"
+        )]
+        all: bool,
+        #[arg(
+            help = "List of attributes. This is a space-separated list of pairs key=value",
+            value_parser = parse_key_val::<String, String>
+        )]
+        attributes: Vec<(String, String)>,
+        #[arg(long, help = "Print only the secret.")]
+        secret_only: bool,
+        #[arg(long, help = "Print the secret in hexadecimal.")]
+        hex: bool,
+        #[arg(long, help = "Format the output as json.")]
+        json: bool,
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(
+        name = "store",
+        about = "Store a secret",
+        after_help = format!("The contents of the secret will be asked afterwards or read from stdin.\n\n{H_STYLE}Examples:{H_STYLE:#}\n  {} store 'My Personal Mail' smtp-port=1025 imap-port=143\n  systemd-ask-password -n | {0} store 'My Secret' lang=en", BINARY_NAME)
+    )]
+    Store {
+        #[arg(help = "Description for the secret")]
+        label: String,
+        #[arg(
+            help = "List of attributes. This is a space-separated list of pairs key=value",
+            value_parser = parse_key_val::<String, String>,
+            required = true, num_args = 1
+        )]
+        attributes: Vec<(String, String)>,
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(name = "list", about = "List all the items in the keyring")]
+    List {
+        #[arg(long, help = "Print the secret in hexadecimal.")]
+        hex: bool,
+        #[arg(long, help = "Format the output as json.")]
+        json: bool,
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(name = "list-collections", about = "List available collections")]
+    ListCollections {
+        #[arg(long, help = "Format the output as json.")]
+        json: bool,
+    },
+
+    #[command(name = "lock", about = "Lock the keyring")]
+    Lock {
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(name = "unlock", about = "Unlock the keyring")]
+    Unlock {
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(name = "repair", about = "Repair the keyring")]
+    Repair {
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(name = "change-secret", about = "Change the keyring secret")]
+    ChangeSecret {
+        #[arg(
+            help = "The new secret. If not provided, it will be read from the terminal. Use '-' to read it from stdin"
+        )]
+        new_secret: Option<String>,
+        #[command(flatten)]
+        arguments: Arguments,
+    },
+
+    #[command(
+        name = "migrate",
+        about = "Migrate a legacy keyring to the current format",
+        after_help = format!("{H_STYLE}Examples:{H_STYLE:#}\n  {} migrate ~/.local/share/keyrings/login.keyring\n  {0} migrate --format kwallet ~/.local/share/kwalletd/kdewallet.kwl", BINARY_NAME)
+    )]
+    Migrate {
+        #[arg(help = "Path to the legacy keyring file")]
+        file: PathBuf,
+        #[arg(short, long, default_value_t, help = "Format of the legacy keyring")]
+        format: MigrateFormat,
+    },
+
+    #[command(
+        name = "merge",
+        about = "Merge the items of a keyring or collection into another",
+        after_help = format!("Each side is a keyring file path, or a collection of the running\n  service by alias, name or label.\n\n{H_STYLE}Example:{H_STYLE:#}\n  {} merge default2 default\n  {0} merge ~/.local/share/keyrings/old.keyring default --origin-secret -", BINARY_NAME)
+    )]
+    Merge {
+        #[arg(help = "The keyring file, collection alias, name or label to merge from")]
+        origin: String,
+        #[arg(help = "The keyring file, collection alias, name or label to merge into")]
+        destination: String,
+        #[arg(
+            long,
+            value_name = "SECRET",
+            help = "The secret of the origin keyring file, use '-' to read it from stdin"
+        )]
+        origin_secret: Option<String>,
+        #[arg(
+            long,
+            value_name = "SECRET",
+            help = "The secret of the destination keyring file, use '-' to read it from stdin"
+        )]
+        destination_secret: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            help = "What to do when an item exists on both sides, defaults to asking"
+        )]
+        on_conflict: Option<OnConflict>,
+    },
+}
+
+#[derive(Clone, Default, clap::ValueEnum, fmt::Debug)]
+enum MigrateFormat {
+    #[default]
+    V0,
+    #[cfg(feature = "kwallet_migration")]
+    Kwallet,
+}
+
+impl fmt::Display for MigrateFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V0 => write!(f, "v0"),
+            #[cfg(feature = "kwallet_migration")]
+            Self::Kwallet => write!(f, "kwallet"),
+        }
+    }
+}
+
+impl Commands {
+    fn arguments(&self) -> Arguments {
+        match self {
+            Self::Delete { arguments, .. }
+            | Self::Lookup { arguments, .. }
+            | Self::Search { arguments, .. }
+            | Self::Store { arguments, .. }
+            | Self::List { arguments, .. }
+            | Self::Lock { arguments }
+            | Self::Unlock { arguments }
+            | Self::Repair { arguments }
+            | Self::ChangeSecret { arguments, .. } => arguments.clone(),
+            Self::ListCollections { .. } | Self::Migrate { .. } | Self::Merge { .. } => {
+                Arguments::default()
+            }
+        }
+    }
+
+    async fn execute(self) -> Result<(), Error> {
+        let mut args = self.arguments();
+
+        if let Commands::Merge {
+            origin,
+            destination,
+            origin_secret,
+            destination_secret,
+            on_conflict,
+        } = self
+        {
+            return merge::run(
+                &origin,
+                &destination,
+                origin_secret,
+                destination_secret,
+                on_conflict,
+            )
+            .await;
+        }
+
+        // A secret of "-" is read from stdin
+        let secret = resolve_secret(args.secret.take())?;
+
+        if matches!(self, Commands::Migrate { .. }) {
+            return self.migrate(secret).await;
+        }
+
+        let service = Service::new().await?;
+
+        if let Commands::ListCollections { json } = self {
+            return Self::list_collections(&service, json).await;
+        }
+        if matches!(self, Commands::ChangeSecret { .. }) && args.app_id.is_some() {
+            return Err(Error::new(
+                "Changing the secret is not supported for application keyrings.",
+            ));
+        }
+        if args.app_id.is_some() && args.keyring.is_some() {
+            return Err(Error::new(
+                "Only one of application ID or keyring can be specified at a time.",
+            ));
+        }
+        // We get the secret first from the app-id, then if the --keyring is
+        // set, we try to use the --secret variable.
+        let (secret, path) = if let Some(app_id) = &args.app_id {
+            let default_collection = service.default_collection().await?;
+            let secret = if let Some(item) = default_collection
+                .search_items(&[("app_id", app_id)])
+                .await?
+                .first()
+            {
+                item.secret().await?
+            } else {
+                return Err(Error::new(
+                    "The application doesn't have a stored key on the host keyring.",
+                ));
+            };
+
+            // That is the path used by libsecret/oo7, how does it work with
+            // kwallet for example?
+            let path = home().map(|mut path| {
+                path.push(".var/app");
+                path.push(app_id.to_string());
+                path.push("data/keyrings/default.keyring");
+                path
+            });
+            (Some(secret), path)
+        } else if let Some(keyring) = args.keyring {
+            let secret = secret.or_else(|| {
+                if std::io::stdin().is_terminal() {
+                    rpassword::prompt_password("Keyring Secret: ")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(oo7::Secret::from)
+                } else {
+                    None
+                }
+            });
+            (secret, Some(keyring))
+        } else if let Some(secret) = secret {
+            (
+                Some(secret),
+                data_dir().map(|mut path| {
+                    path.push("keyrings/default.keyring");
+                    path
+                }),
+            )
+        } else {
+            (None, None)
+        };
+
+        let (prompter_conn, keyring) = match (path, secret) {
+            (Some(path), Some(secret)) => {
+                #[allow(unsafe_code)]
+                let keyring = unsafe {
+                    Keyring::File(oo7::file::UnlockedKeyring::load_unchecked(path, secret).await?)
+                };
+                (None, keyring)
+            }
+
+            (Some(path), None) => {
+                let keyring = Keyring::File(oo7::file::UnlockedKeyring::load(path, None).await?);
+                (None, keyring)
+            }
+            (None, Some(_)) => {
+                return Err(Error::new("A secret requires a keyring."));
+            }
+            _ => {
+                let collection = if let Some(alias) = &args.collection {
+                    service
+                        .with_alias(alias)
+                        .await?
+                        .ok_or_else(|| Error::Owned(format!("Collection '{alias}' not found")))?
+                } else {
+                    service.default_collection().await?
+                };
+
+                let conn = zbus::Connection::session().await?;
+                conn.object_server()
+                    .at("/org/freedesktop/secrets/CliPrompter", CliPrompter)
+                    .await?;
+                conn.request_name("org.freedesktop.secrets.CliPrompter")
+                    .await?;
+
+                (Some(conn), Keyring::Collection(collection))
+            }
+        };
+
+        let output = match self {
+            Commands::Migrate { .. }
+            | Commands::Merge { .. }
+            | Commands::ListCollections { .. } => unreachable!(),
+            Commands::Delete { attributes, .. } => {
+                match keyring {
+                    Keyring::Collection(collection) => {
+                        let items = collection.search_items(&attributes).await?;
+                        for item in items {
+                            item.delete(None).await?;
+                        }
+                    }
+                    Keyring::File(keyring) => {
+                        keyring.delete(&attributes).await?;
+                    }
+                }
+                Output::None
+            }
+            Commands::Lookup {
+                attributes,
+                secret_only,
+                hex,
+                json,
+                ..
+            } => match keyring {
+                Keyring::Collection(collection) => {
+                    let items = collection.search_items(&attributes).await?;
+                    if let Some(item) = items.first() {
+                        if secret_only {
+                            Output::SecretOnly(vec![item.secret().await?], hex)
+                        } else {
+                            Output::Items(vec![ItemOutput::from_dbus_item(item, hex).await?], json)
+                        }
+                    } else {
+                        Output::None
+                    }
+                }
+                Keyring::File(keyring) => {
+                    let items = keyring.search_items(&attributes).await?;
+                    if let Some(item) = items.first() {
+                        if secret_only {
+                            Output::SecretOnly(vec![item.secret().clone()], hex)
+                        } else {
+                            Output::Items(vec![ItemOutput::from_file_item(item, hex)], json)
+                        }
+                    } else {
+                        Output::None
+                    }
+                }
+            },
+            Commands::Search {
+                all,
+                attributes,
+                secret_only,
+                hex,
+                json,
+                ..
+            } => match keyring {
+                Keyring::File(keyring) => {
+                    let items = keyring.search_items(&attributes).await?;
+                    let items_to_print: Vec<_> = if all {
+                        items.iter().collect()
+                    } else {
+                        items.first().into_iter().collect()
+                    };
+
+                    if secret_only {
+                        let secrets = items_to_print
+                            .into_iter()
+                            .map(|item| item.secret().clone())
+                            .collect();
+
+                        Output::SecretOnly(secrets, hex)
+                    } else {
+                        let outputs = items_to_print
+                            .into_iter()
+                            .map(|item| ItemOutput::from_file_item(item, hex))
+                            .collect();
+                        Output::Items(outputs, json)
+                    }
+                }
+                Keyring::Collection(collection) => {
+                    let items = collection.search_items(&attributes).await?;
+                    let items_to_print: Vec<_> = if all {
+                        items.iter().collect()
+                    } else {
+                        items.first().into_iter().collect()
+                    };
+
+                    if secret_only {
+                        let mut secrets = Vec::new();
+                        for item in items_to_print {
+                            secrets.push(item.secret().await?);
+                        }
+
+                        Output::SecretOnly(secrets, hex)
+                    } else {
+                        let mut outputs = Vec::new();
+                        for item in items_to_print {
+                            outputs.push(ItemOutput::from_dbus_item(item, hex).await?);
+                        }
+                        Output::Items(outputs, json)
+                    }
+                }
+            },
+            Commands::Store {
+                label, attributes, ..
+            } => {
+                let mut stdin = std::io::stdin().lock();
+                let secret: oo7::Secret = if stdin.is_terminal() {
+                    print!("Type a secret: ");
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|_| Error::new("Could not flush stdout"))?;
+                    rpassword::read_password()
+                        .map_err(|_| Error::new("Can't read password"))?
+                        .into()
+                } else {
+                    let mut buf = Vec::new();
+                    stdin.read_to_end(&mut buf)?;
+                    match String::from_utf8(buf) {
+                        Ok(s) => oo7::Secret::text(s),
+                        Err(e) => oo7::Secret::blob(e.into_bytes()),
+                    }
+                };
+
+                match keyring {
+                    Keyring::File(keyring) => {
+                        keyring
+                            .create_item(&label, &attributes, secret, true)
+                            .await?;
+                    }
+                    Keyring::Collection(collection) => {
+                        collection
+                            .create_item(&label, &attributes, secret, true, None)
+                            .await?;
+                    }
+                }
+                Output::None
+            }
+            Commands::List { hex, json, .. } => {
+                let items = match keyring {
+                    Keyring::File(keyring) => {
+                        let items = keyring.all_items().await?;
+                        let mut outputs = Vec::new();
+                        let mut n_invalid = 0;
+                        for item in items {
+                            match item {
+                                Ok(item) => outputs.push(ItemOutput::from_file_item(&item, hex)),
+                                Err(_) => n_invalid += 1,
+                            }
+                        }
+                        if !json && n_invalid > 0 {
+                            if outputs.is_empty() {
+                                // All items fail to decrypt -> secret is wrong
+                                println!(
+                                    "None of the items could be decrypted, the keyring secret is likely wrong"
+                                );
+                            } else {
+                                println!("{n_invalid} items are not valid and cannot be decrypted");
+                            }
+                        }
+                        outputs
+                    }
+                    Keyring::Collection(collection) => {
+                        let items = collection.items().await?;
+                        let mut outputs = Vec::new();
+                        for item in items {
+                            outputs.push(ItemOutput::from_dbus_item(&item, hex).await?);
+                        }
+                        outputs
+                    }
+                };
+                Output::Items(items, json)
+            }
+            Commands::Lock { .. } => {
+                match keyring {
+                    Keyring::File(_) => {
+                        return Err(Error::new("Keyring file doesn't support locking."));
+                    }
+                    Keyring::Collection(collection) => {
+                        collection.lock(None).await?;
+                    }
+                }
+                Output::None
+            }
+            Commands::Unlock { .. } => {
+                match keyring {
+                    Keyring::File(_) => {
+                        return Err(Error::new("Keyring file doesn't support unlocking."));
+                    }
+                    Keyring::Collection(collection) => {
+                        collection.unlock(None).await?;
+                    }
+                }
+                Output::None
+            }
+            Commands::Repair { .. } => {
+                match keyring {
+                    Keyring::File(keyring) => {
+                        let deleted_items = keyring.delete_broken_items().await?;
+                        println!("{deleted_items} broken items were deleted");
+                    }
+                    Keyring::Collection(_) => {
+                        return Err(Error::new("Only a keyring file can be repaired."));
+                    }
+                }
+                Output::None
+            }
+            Commands::ChangeSecret { new_secret, .. } => {
+                match keyring {
+                    Keyring::File(keyring) => {
+                        let secret = match resolve_secret(new_secret)? {
+                            Some(s) => s,
+                            None => {
+                                let s = rpassword::prompt_password("Type the new secret: ")
+                                    .map_err(|_| Error::new("Can't read secret"))?;
+                                oo7::Secret::from(s)
+                            }
+                        };
+                        keyring.change_secret(secret).await?;
+                    }
+                    Keyring::Collection(collection) => {
+                        let conn = prompter_conn
+                            .as_ref()
+                            .expect("D-Bus connection available in collection mode");
+
+                        let introspectable = zbus::fdo::IntrospectableProxy::builder(conn)
+                            .destination("org.freedesktop.secrets")
+                            .path("/org/freedesktop/secrets")
+                            .build()
+                            .await?;
+                        let xml = introspectable.introspect().await?;
+                        if !xml
+                            .contains("org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface")
+                        {
+                            return Err(Error::new(
+                                "The Secret Service server does not support changing the keyring secret.",
+                            ));
+                        }
+
+                        let internal_proxy = InternalInterfaceProxy::new(conn).await?;
+                        let prompt_path =
+                            internal_proxy.change_with_prompt(collection.path()).await?;
+
+                        if let Some(prompt) = oo7::dbus::api::Prompt::new(conn, prompt_path).await?
+                        {
+                            prompt.receive_completed(None).await?;
+                        }
+                    }
+                }
+                Output::None
+            }
+        };
+
+        // Unified output printing
+        match output {
+            Output::None => {}
+            Output::SecretOnly(secrets, hex) => {
+                for secret in secrets {
+                    print_secret_only(&secret, hex)?;
+                }
+            }
+            Output::Items(items, json) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&items).unwrap());
+                } else {
+                    for item in items {
+                        print!("{}", item);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn migrate(self, secret: Option<oo7::Secret>) -> Result<(), Error> {
+        let Self::Migrate { file, format } = self else {
+            unreachable!();
+        };
+        if !file.exists() {
+            return Err(Error::Owned(format!(
+                "File '{}' does not exist.",
+                file.display()
+            )));
+        }
+
+        let name = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::new("Cannot determine keyring name from file path"))?;
+
+        let parent = file
+            .parent()
+            .ok_or_else(|| Error::new("Cannot determine parent directory of keyring file"))?;
+        let target_path = parent.join("v1").join(format!("{name}.keyring"));
+
+        match format {
+            MigrateFormat::V0 => {
+                let keyring =
+                    oo7::file::UnlockedKeyring::load_from_v0(&file, &target_path, secret).await?;
+                let n_items = keyring.n_items().await;
+                keyring.write().await?;
+
+                println!(
+                    "Migrated v0 keyring '{name}' ({n_items} items) to {}.",
+                    target_path.display()
+                );
+            }
+            #[cfg(feature = "kwallet_migration")]
+            MigrateFormat::Kwallet => {
+                let secret = secret.ok_or_else(|| {
+                    Error::new("KWallet migration requires a secret (use --secret)")
+                })?;
+
+                let path = file.to_path_buf();
+                let password = secret.to_vec();
+                let wallet = tokio::task::spawn_blocking(move || {
+                    kwallet_parser::KWalletFile::open(&path, &password)
+                })
+                .await
+                .map_err(|e| Error::Owned(format!("Task join error: {e}")))?
+                .map_err(|e| Error::Owned(format!("Failed to open KWallet file: {e}")))?;
+
+                let keyring =
+                    oo7::file::UnlockedKeyring::open_at(parent, name, Some(secret)).await?;
+
+                let mut n_items = 0usize;
+                for (folder_name, folder) in wallet.wallet() {
+                    for (entry_key, entry) in folder {
+                        match kwallet_parser::convert_entry(folder_name, entry_key, entry) {
+                            Ok(ss_entry) => {
+                                keyring
+                                    .create_item(
+                                        ss_entry.label(),
+                                        ss_entry.attributes(),
+                                        oo7::Secret::blob(ss_entry.secret()),
+                                        true,
+                                    )
+                                    .await?;
+                                n_items += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("Skipping entry {folder_name}/{entry_key}: {e}");
+                            }
+                        }
+                    }
+                }
+                keyring.write().await?;
+
+                println!(
+                    "Migrated KWallet '{name}' ({n_items} items) to {}.",
+                    target_path.display()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn list_collections(service: &Service, json: bool) -> Result<(), Error> {
+        let mut entries = Vec::new();
+        for collection in &service.collections().await? {
+            entries.push(CollectionOutput::from_collection(collection).await?);
+        }
+        if json {
+            println!("{}", serde_json::to_string_pretty(&entries).unwrap());
+        } else {
+            for entry in &entries {
+                print!("{entry}");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
+#[clap(version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        global = true,
+        help = "Print debug information during command processing."
+    )]
+    is_verbose: bool,
+}
+
+#[derive(Args, Clone, Default)]
+struct Arguments {
+    #[arg(
+        name = "collection",
+        short,
+        long,
+        help = "Specify a collection by name. The default collection will be used if not specified"
+    )]
+    collection: Option<String>,
+    #[arg(
+        name = "keyring",
+        short,
+        long,
+        help = "Specify the path to a keyring file"
+    )]
+    keyring: Option<PathBuf>,
+    #[arg(
+        name = "secret",
+        short,
+        long,
+        help = "Specify the keyring secret. Use '-' to read it from stdin"
+    )]
+    secret: Option<String>,
+    #[arg(name = "app-id", long, help = "Specify a sandboxed application ID")]
+    app_id: Option<oo7::ashpd::AppID>,
+}
+
+/// Read a secret from stdin, prompting on the terminal if there is one.
+fn read_secret_from_stdin() -> Result<oo7::Secret, Error> {
+    let mut stdin = std::io::stdin().lock();
+    if stdin.is_terminal() {
+        rpassword::prompt_password("Keyring secret: ")
+            .map(Into::into)
+            .map_err(|_| Error::new("Can't read secret"))
+    } else {
+        let mut buf = Vec::new();
+        stdin
+            .read_to_end(&mut buf)
+            .map_err(|_| Error::new("Can't read secret"))?;
+        // Drop the trailing newline added by echo
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        Ok(buf.into())
+    }
+}
+
+/// Resolve a secret argument, reading it from stdin when set to "-".
+pub(crate) fn resolve_secret(secret: Option<String>) -> Result<Option<oo7::Secret>, Error> {
+    match secret {
+        Some(s) if s == "-" => Ok(Some(read_secret_from_stdin()?)),
+        Some(s) => Ok(Some(s.into())),
+        None => Ok(None),
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Error> {
+    let cli = Cli::parse();
+
+    if cli.is_verbose {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
+
+    cli.command.execute().await
+}
+
+// Source <https://github.com/clap-rs/clap/blob/master/examples/typed-derive.rs#L48>
+fn parse_key_val<T, U>(
+    s: &str,
+) -> Result<(T, U), Box<dyn std::error::Error + Send + Sync + 'static>>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+    U: std::str::FromStr,
+    U::Err: std::error::Error + Send + Sync + 'static,
+{
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("Invalid KEY=value: no `=` found in `{s}`"))?;
+    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+}
+
+fn print_secret_only(secret: &oo7::Secret, as_hex: bool) -> Result<(), Error> {
+    let bytes = secret.as_bytes();
+    let mut stdout = std::io::stdout().lock();
+    if as_hex {
+        let hex = hex::encode(bytes);
+        stdout.write_all(hex.as_bytes())?;
+    } else {
+        stdout.write_all(bytes)?;
+    }
+    // Add a new line if we are writing to a tty
+    if stdout.is_terminal() {
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+// Copy from /client/src/file/api/mod.rs
+fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home().map(|p| p.join(".local/share")))
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}

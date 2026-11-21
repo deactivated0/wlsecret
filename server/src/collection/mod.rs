@@ -1,0 +1,848 @@
+// org.freedesktop.Secret.Collection
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use oo7::{
+    Secret,
+    dbus::{
+        ServiceError,
+        api::{DBusSecretInner, Properties},
+    },
+    file::Keyring,
+};
+use tokio::sync::{Mutex, RwLock};
+use wire::{ObjectPath, OwnedObjectPath};
+use zbus::{interface, object_server::SignalEmitter, proxy::Defaults, wire};
+
+use crate::{
+    Service,
+    error::{Error, custom_service_error},
+    item,
+};
+
+#[derive(Clone)]
+pub struct Collection {
+    // Properties
+    items: Arc<Mutex<Vec<item::Item>>>,
+    label: Arc<Mutex<String>>,
+    created: Duration,
+    modified: Arc<Mutex<Duration>>,
+    // Other attributes
+    name: String,
+    alias: Arc<Mutex<String>>,
+    pub(crate) keyring: Arc<RwLock<Option<Keyring>>>,
+    service: Service,
+    item_index: Arc<RwLock<u32>>,
+    path: OwnedObjectPath,
+}
+
+#[interface(name = "org.freedesktop.Secret.Collection")]
+impl Collection {
+    #[zbus(out_args("prompt"))]
+    pub async fn delete(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<OwnedObjectPath, ServiceError> {
+        let caller = if let Some(sender) = header.sender() {
+            self.service.peer_display_name(sender).await
+        } else {
+            "unknown".to_string()
+        };
+        // Deleting the placeholder of a pending migration would migrate
+        // the legacy keyring and throw the result away
+        if self.service.has_pending_migration(self.name()).await {
+            return Err(ServiceError::IsLocked(format!(
+                "Collection `{}` holds a keyring awaiting migration, unlock it first.",
+                self.path
+            )));
+        }
+        // Check if collection is locked
+        if self.is_locked().await {
+            // Create a prompt to unlock and delete the collection
+            let prompt = crate::prompt::Prompt::new(
+                self.service.clone(),
+                crate::prompt::PromptRole::Unlock,
+                self.label().await,
+                Some(self.clone()),
+            )
+            .await;
+            let prompt_path = OwnedObjectPath::from(prompt.path().clone());
+
+            let collection = self.clone();
+            let service = self.service.clone();
+            let caller_owned = caller;
+            let action =
+                crate::prompt::PromptAction::new(move |unlock_secret: Option<Secret>| async move {
+                    // Unlock the collection, completing a pending migration
+                    service
+                        .unlock_collection(&collection, unlock_secret)
+                        .await?;
+
+                    collection.delete_unlocked(&caller_owned).await?;
+
+                    Ok(wire::Variant::new(OwnedObjectPath::default())
+                        .try_into_owned()
+                        .unwrap())
+                });
+
+            prompt.set_action(action).await;
+
+            self.service
+                .register_prompt(prompt_path.clone(), prompt.clone())
+                .await;
+
+            self.service
+                .object_server()
+                .at(&prompt_path, prompt)
+                .await?;
+
+            tracing::debug!(
+                "Delete prompt created at `{}` for locked collection `{}`",
+                prompt_path,
+                self.path
+            );
+
+            return Ok(prompt_path);
+        }
+
+        self.delete_unlocked(&caller).await?;
+        Ok(OwnedObjectPath::default())
+    }
+
+    async fn delete_unlocked(&self, caller: &str) -> Result<(), ServiceError> {
+        let keyring_path = {
+            let keyring_guard = self.keyring.read().await;
+            let keyring = match keyring_guard.as_ref() {
+                Some(k) if !k.is_locked() => k.as_unlocked(),
+                _ => return Err(ServiceError::IsLocked("Collection is locked".to_owned())),
+            };
+            keyring.path().map(|p| p.to_path_buf())
+        };
+
+        let object_server = self.service.object_server();
+
+        // Remove all items from the object server
+        let items = self.items.lock().await;
+        for item in items.iter() {
+            object_server.remove::<item::Item, _>(item.path()).await?;
+        }
+        drop(items);
+
+        // Delete the keyring file if it's persistent
+        if let Some(path) = keyring_path {
+            tokio::fs::remove_file(&path).await.map_err(|err| {
+                custom_service_error(&format!("Failed to delete keyring file: {err}"))
+            })?;
+            tracing::debug!("Deleted keyring file: {}", path.display());
+        }
+
+        // Emit CollectionDeleted signal before removing from object server
+        let service_path = oo7::dbus::api::Service::PATH.as_ref().unwrap();
+        let signal_emitter = self.service.signal_emitter(service_path)?;
+        Service::collection_deleted(&signal_emitter, &self.path).await?;
+
+        // Remove collection from object server
+        object_server.remove::<Collection, _>(&self.path).await?;
+        self.remove_alias_path(&self.alias().await).await;
+
+        // Notify service to remove from collections list
+        self.service.remove_collection(&self.path).await;
+
+        tracing::info!("Collection `{}` deleted by {caller}.", self.path);
+
+        Ok(())
+    }
+
+    #[zbus(out_args("results"))]
+    pub async fn search_items(
+        &self,
+        attributes: HashMap<String, String>,
+    ) -> Result<Vec<OwnedObjectPath>, ServiceError> {
+        let results = self
+            .search_inner_items(&attributes)
+            .await?
+            .iter()
+            .map(|item| item.path().clone().into())
+            .collect::<Vec<OwnedObjectPath>>();
+
+        if results.is_empty() {
+            tracing::debug!(
+                "Items with attributes {:?} does not exist in collection: {}.",
+                attributes,
+                self.path
+            );
+        } else {
+            tracing::debug!(
+                "Items with attributes {:?} found in collection: {}.",
+                attributes,
+                self.path
+            );
+        }
+
+        Ok(results)
+    }
+
+    #[zbus(out_args("item", "prompt"))]
+    pub async fn create_item(
+        &self,
+        properties: Properties,
+        secret: DBusSecretInner,
+        replace: bool,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(OwnedObjectPath, OwnedObjectPath), ServiceError> {
+        let caller = if let Some(sender) = header.sender() {
+            self.service.peer_display_name(sender).await
+        } else {
+            "unknown".to_string()
+        };
+        tracing::debug!("CreateItem called by {caller} with session {}", secret.0);
+        if self.is_locked().await {
+            // Create a prompt to unlock the collection and create the item
+            let prompt = crate::prompt::Prompt::new(
+                self.service.clone(),
+                crate::prompt::PromptRole::Unlock,
+                self.label().await,
+                Some(self.clone()),
+            )
+            .await;
+            let prompt_path = OwnedObjectPath::from(prompt.path().clone());
+
+            let collection = self.clone();
+            let service = self.service.clone();
+            let action =
+                crate::prompt::PromptAction::new(move |unlock_secret: Option<Secret>| async move {
+                    // Unlock the collection, completing a pending migration
+                    service
+                        .unlock_collection(&collection, unlock_secret)
+                        .await?;
+
+                    let item_path = collection
+                        .create_item_unlocked(properties, secret, replace)
+                        .await?;
+
+                    Ok(wire::Variant::new(item_path).try_into_owned().unwrap())
+                });
+
+            prompt.set_action(action).await;
+
+            self.service
+                .register_prompt(prompt_path.clone(), prompt.clone())
+                .await;
+
+            self.service
+                .object_server()
+                .at(&prompt_path, prompt)
+                .await?;
+
+            tracing::debug!(
+                "CreateItem prompt created at `{}` for locked collection `{}`",
+                prompt_path,
+                self.path
+            );
+
+            return Ok((OwnedObjectPath::default(), prompt_path));
+        }
+
+        let item_path = self
+            .create_item_unlocked(properties, secret, replace)
+            .await?;
+
+        Ok((item_path, OwnedObjectPath::default()))
+    }
+
+    async fn create_item_unlocked(
+        &self,
+        properties: Properties,
+        secret: DBusSecretInner,
+        replace: bool,
+    ) -> Result<OwnedObjectPath, ServiceError> {
+        let keyring_guard = self.keyring.read().await;
+        let keyring = match keyring_guard.as_ref() {
+            Some(k) if !k.is_locked() => k.as_unlocked(),
+            _ => return Err(ServiceError::IsLocked("Collection is locked".to_owned())),
+        };
+
+        let DBusSecretInner(ref session_path, ref iv, ref secret_bytes, ref content_type) = secret;
+        let label = properties.label();
+        // Safe to unwrap as an item always has attributes
+        let mut attributes = properties.attributes().unwrap().to_owned();
+
+        let Some(session) = self.service.session(session_path).await else {
+            tracing::error!(
+                "The session `{}` does not exist, referenced while creating item in collection `{}`.",
+                session_path,
+                self.path
+            );
+            return Err(ServiceError::NoSession(format!(
+                "The session `{session_path}` does not exist."
+            )));
+        };
+
+        let secret = match session.aes_key() {
+            Some(key) => oo7::crypto::decrypt(secret_bytes, &key, iv)
+                .map_err(|err| custom_service_error(&format!("Failed to decrypt secret {err}.")))?,
+            None => zeroize::Zeroizing::new(secret_bytes.clone()),
+        };
+
+        // Ensure content-type attribute is stored
+        if !attributes.contains_key(oo7::CONTENT_TYPE_ATTRIBUTE) {
+            attributes.insert(
+                oo7::CONTENT_TYPE_ATTRIBUTE.to_owned(),
+                content_type.as_str().to_owned(),
+            );
+        }
+
+        let key = keyring
+            .key()
+            .await
+            .map_err(|err| custom_service_error(&format!("Failed to derive key: {err}")))?;
+
+        // When replacing, find existing items that match so we can update the
+        // first one in place, keeping its D-Bus object path valid for any
+        // concurrent GetSecret callers.
+        let existing_items = if replace {
+            let items = self
+                .search_items_with_key(&attributes, key.as_deref(), true)
+                .await?;
+            if items.is_empty() { None } else { Some(items) }
+        } else {
+            None
+        };
+
+        let new_file_item = keyring
+            .create_item(label, &attributes, secret, existing_items.is_some())
+            .await
+            .map_err(|err| custom_service_error(&format!("Failed to create a new item {err}.")))?;
+        drop(keyring_guard);
+
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+        let object_server = self.service.object_server();
+
+        let item_path = if let Some(existing_items) = existing_items {
+            let kept = &existing_items[0];
+            let kept_path: OwnedObjectPath = kept.path().to_owned().into();
+            *kept.inner.lock().await = Some(new_file_item.into());
+
+            // Remove any duplicate matches beyond the first.
+            if existing_items.len() > 1 {
+                let mut items = self.items.lock().await;
+                for dup in &existing_items[1..] {
+                    let dup_path = dup.path();
+                    items.retain(|i| i.path() != dup_path);
+                    object_server.remove::<item::Item, _>(dup_path).await?;
+                    Self::item_deleted(&signal_emitter, dup_path).await?;
+                }
+            }
+
+            Self::item_changed(&signal_emitter, &kept_path).await?;
+            kept_path
+        } else {
+            let n_items = *self.item_index.read().await;
+            let new_path = OwnedObjectPath::try_from(format!("{}/{n_items}", self.path)).unwrap();
+
+            let item = item::Item::new(
+                new_file_item.into(),
+                self.service.clone(),
+                self.path.clone(),
+                new_path.clone(),
+            );
+            *self.item_index.write().await = n_items + 1;
+
+            self.items.lock().await.push(item.clone());
+            object_server.at(&new_path, item).await?;
+
+            Self::item_created(&signal_emitter, &new_path).await?;
+            new_path
+        };
+
+        self.update_modified().await?;
+        self.items_changed(&signal_emitter).await?;
+
+        match session.peer_info() {
+            Some(info) => tracing::info!(
+                "Item `{item_path}` created by {} ({info}).",
+                session.sender()
+            ),
+            None => tracing::info!("Item `{item_path}` created by {}.", session.sender()),
+        }
+
+        Ok(item_path)
+    }
+
+    #[zbus(property, name = "Items")]
+    pub async fn items(&self) -> Vec<OwnedObjectPath> {
+        self.items
+            .lock()
+            .await
+            .iter()
+            .map(|i| i.path().to_owned().into())
+            .collect()
+    }
+
+    #[zbus(property, name = "Label")]
+    pub async fn label(&self) -> String {
+        self.label.lock().await.clone()
+    }
+
+    #[zbus(property, name = "Label")]
+    pub async fn set_label(&self, label: &str) -> Result<(), ServiceError> {
+        if self.is_locked().await {
+            return Err(ServiceError::IsLocked(format!(
+                "Collection `{}` is locked.",
+                self.path
+            )));
+        }
+
+        let old_label = {
+            let mut guard = self.label.lock().await;
+            let old = guard.clone();
+            *guard = label.to_owned();
+            old
+        };
+        tracing::info!(
+            "Collection `{}` label changed from \"{}\" to \"{}\".",
+            self.path,
+            old_label,
+            label
+        );
+
+        self.update_modified().await?;
+
+        let service_path = oo7::dbus::api::Service::PATH.as_ref().unwrap();
+        let signal_emitter = self.service.signal_emitter(service_path)?;
+        Service::collection_changed(&signal_emitter, &self.path).await?;
+
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+        self.label_changed(&signal_emitter).await?;
+
+        Ok(())
+    }
+
+    #[zbus(property, name = "Locked")]
+    pub async fn is_locked(&self) -> bool {
+        self.keyring
+            .read()
+            .await
+            .as_ref()
+            .map(|k| k.is_locked())
+            .unwrap_or(true)
+    }
+
+    #[zbus(property, name = "Created")]
+    pub fn created_at(&self) -> u64 {
+        self.created.as_secs()
+    }
+
+    #[zbus(property, name = "Modified")]
+    pub async fn modified_at(&self) -> u64 {
+        self.modified.lock().await.as_secs()
+    }
+
+    #[zbus(signal, name = "ItemCreated")]
+    async fn item_created(
+        signal_emitter: &SignalEmitter<'_>,
+        item: &ObjectPath<'_>,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal, name = "ItemDeleted")]
+    pub async fn item_deleted(
+        signal_emitter: &SignalEmitter<'_>,
+        item: &ObjectPath<'_>,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal, name = "ItemChanged")]
+    pub async fn item_changed(
+        signal_emitter: &SignalEmitter<'_>,
+        item: &ObjectPath<'_>,
+    ) -> zbus::Result<()>;
+}
+
+pub(crate) fn alias_path(alias: &str) -> Option<OwnedObjectPath> {
+    OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/aliases/{alias}")).ok()
+}
+
+pub(crate) fn collection_path(label: &str) -> Result<OwnedObjectPath, wire::Error> {
+    let mut sanitized_label = label
+        .to_lowercase()
+        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_");
+    if sanitized_label.is_empty() {
+        // An empty label would produce a path with a trailing slash
+        sanitized_label = "_".to_owned();
+    }
+
+    OwnedObjectPath::try_from(format!(
+        "/org/freedesktop/secrets/collection/{sanitized_label}"
+    ))
+}
+
+impl Collection {
+    pub async fn new(
+        name: &str,
+        label: &str,
+        alias: &str,
+        service: Service,
+        keyring: Keyring,
+    ) -> Self {
+        let modified = keyring.modified_time().await;
+        let created = keyring.created_time().await.unwrap_or(modified);
+
+        Self {
+            items: Default::default(),
+            label: Arc::new(Mutex::new(label.to_owned())),
+            modified: Arc::new(Mutex::new(modified)),
+            name: name.to_owned(),
+            alias: Arc::new(Mutex::new(alias.to_owned())),
+            item_index: Arc::new(RwLock::new(0)),
+            path: collection_path(label)
+                .expect("Label should already be sanitized and produce valid object path"),
+            created,
+            service,
+            keyring: Arc::new(RwLock::new(Some(keyring))),
+        }
+    }
+
+    pub fn path(&self) -> &ObjectPath<'_> {
+        &self.path
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub async fn set_alias(&self, alias: &str) {
+        let old_alias = std::mem::replace(&mut *self.alias.lock().await, alias.to_owned());
+        self.remove_alias_path(&old_alias).await;
+        self.serve_alias_path(alias).await;
+    }
+
+    /// Serve this collection at the path of `alias`, in place of the
+    /// collection served there before
+    pub async fn serve_alias_path(&self, alias: &str) {
+        let Some(path) = alias_path(alias) else {
+            return;
+        };
+        let object_server = self.service.object_server();
+        let _ = object_server.remove::<Collection, _>(&path).await;
+        if let Err(err) = object_server.at(&path, self.clone()).await {
+            tracing::warn!(
+                "Failed to serve collection `{}` at `{path}`: {err}",
+                self.path
+            );
+        }
+    }
+
+    /// Stop serving this collection at the path of `alias`
+    async fn remove_alias_path(&self, alias: &str) {
+        let Some(path) = alias_path(alias) else {
+            return;
+        };
+        let object_server = self.service.object_server();
+        let serves_self = match object_server.interface::<_, Collection>(&path).await {
+            Ok(collection) => collection.get().await.path == self.path,
+            Err(_) => false,
+        };
+        if serves_self {
+            let _ = object_server.remove::<Collection, _>(&path).await;
+        }
+    }
+
+    pub async fn alias(&self) -> String {
+        self.alias.lock().await.clone()
+    }
+
+    pub async fn search_inner_items(
+        &self,
+        attributes: &HashMap<String, String>,
+    ) -> Result<Vec<item::Item>, ServiceError> {
+        let keyring_guard = self.keyring.read().await;
+        let Some(keyring) = keyring_guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if keyring.is_locked() {
+            drop(keyring_guard);
+
+            // The placeholder items of a pending migration store their
+            // attribute values as MD5 digests; hash the searched values
+            // to match them. The generic schema fallback is compared
+            // as-is.
+            let hashed: HashMap<String, String> = attributes
+                .iter()
+                .map(|(key, value)| {
+                    if key.as_str() == oo7::XDG_SCHEMA_ATTRIBUTE
+                        && value.as_str() == oo7::GENERIC_SCHEMA
+                    {
+                        (key.clone(), value.clone())
+                    } else {
+                        (key.clone(), oo7::crypto::md5_hex(value))
+                    }
+                })
+                .collect();
+            return self.search_items_with_key(&hashed, None, false).await;
+        }
+        let key = keyring
+            .as_unlocked()
+            .key()
+            .await
+            .map_err(|err| custom_service_error(&format!("Failed to derive key: {err}")))?;
+        drop(keyring_guard);
+
+        self.search_items_with_key(attributes, key.as_deref(), false)
+            .await
+    }
+
+    async fn search_items_with_key(
+        &self,
+        attributes: &HashMap<String, String>,
+        key: Option<&oo7::Key>,
+        exact: bool,
+    ) -> Result<Vec<item::Item>, ServiceError> {
+        let query = oo7::file::api::PreparedQuery::new(attributes, key);
+        let mut matching_items = Vec::new();
+        let items = self.items.lock().await;
+
+        for item_wrapper in items.iter() {
+            let inner = item_wrapper.inner.lock().await;
+            let Some(file_item) = inner.as_ref() else {
+                continue;
+            };
+
+            let matches = if exact {
+                file_item.matches_attributes_exact(attributes, key)
+            } else {
+                file_item.matches_attributes_prepared(&query)
+            };
+            if matches {
+                matching_items.push(item_wrapper.clone());
+            }
+        }
+
+        Ok(matching_items)
+    }
+
+    pub async fn item_from_path(&self, path: &ObjectPath<'_>) -> Option<item::Item> {
+        let items = self.items.lock().await;
+
+        items.iter().find(|i| i.path() == path).cloned()
+    }
+
+    pub async fn set_locked(
+        &self,
+        locked: bool,
+        secret: Option<Secret>,
+    ) -> Result<(), ServiceError> {
+        let mut keyring_guard = self.keyring.write().await;
+
+        if let Some(old_keyring) = keyring_guard.take() {
+            let new_keyring = match (old_keyring, locked) {
+                (Keyring::Unlocked(unlocked), true) => {
+                    let items = self.items.lock().await;
+                    for item in items.iter() {
+                        item.set_locked(locked, &unlocked).await?;
+                    }
+                    drop(items);
+
+                    Keyring::Locked(unlocked.lock())
+                }
+                (Keyring::Locked(locked_kr), false) => {
+                    let unlock_result = if let Some(secret) = secret {
+                        locked_kr.try_unlock(secret).await
+                    } else {
+                        locked_kr.try_unlock_unencrypted().await
+                    };
+
+                    let unlocked = match unlock_result {
+                        Ok(unlocked) => unlocked,
+                        Err(err) => {
+                            // Put the locked keyring back, it can be
+                            // unlocked again
+                            *keyring_guard = Some(Keyring::Locked(locked_kr));
+                            return Err(custom_service_error(&format!(
+                                "Failed to unlock keyring: {err}"
+                            )));
+                        }
+                    };
+
+                    let items = self.items.lock().await;
+                    for item in items.iter() {
+                        item.set_locked(locked, &unlocked).await?;
+                    }
+                    drop(items);
+
+                    Keyring::Unlocked(unlocked)
+                }
+                (other, _) => other,
+            };
+            *keyring_guard = Some(new_keyring);
+        }
+
+        drop(keyring_guard);
+
+        // Emit signals
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+        self.locked_changed(&signal_emitter).await?;
+
+        let service_path = oo7::dbus::api::Service::PATH.as_ref().unwrap();
+        let signal_emitter = self.service.signal_emitter(service_path)?;
+        Service::collection_changed(&signal_emitter, &self.path).await?;
+
+        tracing::debug!(
+            "Collection: {} is {}.",
+            self.path,
+            if locked { "locked" } else { "unlocked" }
+        );
+
+        Ok(())
+    }
+
+    pub async fn dispatch_items(&self) -> Result<(), Error> {
+        let keyring_items = {
+            let keyring_guard = self.keyring.read().await;
+            let keyring = keyring_guard.as_ref().unwrap();
+            keyring.items().await?
+        };
+        self.dispatch_file_items(keyring_items).await
+    }
+
+    /// Register the given file items on the object server and notify
+    /// clients.
+    pub async fn dispatch_file_items(
+        &self,
+        keyring_items: Vec<oo7::file::Item>,
+    ) -> Result<(), Error> {
+        tracing::debug!(
+            "Dispatching {} items for collection `{}`.",
+            keyring_items.len(),
+            self.path
+        );
+
+        let mut dispatched_items = Vec::new();
+        {
+            let mut items = self.items.lock().await;
+            let object_server = self.service.object_server();
+            let mut n_items = 1;
+
+            for keyring_item in keyring_items {
+                let item_path =
+                    OwnedObjectPath::try_from(format!("{}/{n_items}", self.path)).unwrap();
+                let item = item::Item::new(
+                    keyring_item,
+                    self.service.clone(),
+                    self.path.clone(),
+                    item_path.clone(),
+                );
+                n_items += 1;
+
+                items.push(item.clone());
+                dispatched_items.push(item.clone());
+                object_server.at(item_path, item).await?;
+            }
+
+            *self.item_index.write().await = n_items;
+        }
+
+        // Notify clients about the newly dispatched items.
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+        for item in &dispatched_items {
+            Self::item_created(&signal_emitter, item.path()).await?;
+        }
+        self.items_changed(&signal_emitter).await?;
+
+        Ok(())
+    }
+
+    /// Remove all items from the object server and the collection.
+    async fn clear_items(&self) -> Result<(), Error> {
+        let mut items = self.items.lock().await;
+        let object_server = self.service.object_server();
+        for item in items.iter() {
+            object_server.remove::<item::Item, _>(item.path()).await?;
+        }
+        items.clear();
+        Ok(())
+    }
+
+    /// Replace the keyring with a just-migrated one, dispatch its items
+    /// and emit the corresponding change signals.
+    pub async fn apply_migrated_keyring(&self, keyring: Keyring) -> Result<(), Error> {
+        *self.keyring.write().await = Some(keyring);
+
+        // Drop the placeholder items, the migrated items take their paths
+        self.clear_items().await?;
+        self.dispatch_items().await?;
+
+        // The keyring swap bypasses set_locked, so emit Locked here.
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+        self.locked_changed(&signal_emitter).await?;
+
+        let service_path = oo7::dbus::api::Service::PATH.as_ref().unwrap();
+        let signal_emitter = self.service.signal_emitter(service_path)?;
+        Service::collection_changed(&signal_emitter, &self.path).await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_item(&self, path: &ObjectPath<'_>) -> Result<(), ServiceError> {
+        tracing::debug!("Deleting item `{}` from collection `{}`.", path, self.path);
+        let Some(item) = self.item_from_path(path).await else {
+            return Err(ServiceError::NoSuchObject(format!(
+                "Item `{path}` does not exist."
+            )));
+        };
+
+        if item.is_locked().await {
+            return Err(ServiceError::IsLocked(format!(
+                "Cannot delete a locked item `{path}`"
+            )));
+        }
+
+        let attributes = item.attributes().await.map_err(|err| {
+            custom_service_error(&format!("Failed to read item attributes {err}"))
+        })?;
+
+        let keyring_guard = self.keyring.read().await;
+        let keyring = match keyring_guard.as_ref() {
+            Some(k) if !k.is_locked() => k.as_unlocked(),
+            _ => {
+                return Err(ServiceError::IsLocked(format!(
+                    "Cannot delete an item `{path}` in a locked collection"
+                )));
+            }
+        };
+
+        keyring
+            .delete(&attributes)
+            .await
+            .map_err(|err| custom_service_error(&format!("Failed to deleted item {err}.")))?;
+
+        let mut items = self.items.lock().await;
+        items.retain(|item| item.path() != path);
+        drop(items);
+
+        self.update_modified().await?;
+
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+        self.items_changed(&signal_emitter).await?;
+
+        Ok(())
+    }
+
+    /// Update the modified timestamp and emit the PropertiesChanged signal
+    async fn update_modified(&self) -> Result<(), ServiceError> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        *self.modified.lock().await = now;
+
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+        self.modified_changed(&signal_emitter).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;

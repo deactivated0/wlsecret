@@ -1,0 +1,35 @@
+[package]
+name = "oo7-pam"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "PAM module for oo7 Secret Service integration"
+
+[lib]
+name = "pam_oo7"
+# The rlib also lets Cargo build the shared module for integration tests.
+crate-type = ["cdylib", "rlib"]
+
+# Loaded by the integration tests
+[[example]]
+name = "pam_test_tokens"
+path = "tests/common/tokens.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_repr.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time"] }
+tracing.workspace = true
+tracing-journald.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+zeroize.workspace = true
+zgvariant.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
